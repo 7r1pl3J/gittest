@@ -2,7 +2,7 @@
 
 ### 架构
 
-![GPU管理模型](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/gpu_management_model.png)
+![GPU管理模型](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/gpu_management_model.png) 
 
 **MIMO**
 
@@ -379,7 +379,243 @@ vma的flag位设置，可以看出子进程是不共享该gpu内存的
 	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_IO;
 ```
 
-与直接分配物理页不同，KBASE_IOCTL_MEM_IMPORT可以导入cpu的地址到gpu
+与直接分配物理页不同，KBASE_IOCTL_MEM_IMPORT可以导入cpu的地址到gpu，传入的参数为
+
+```c
+union kbase_ioctl_mem_import {
+	struct {
+		__u64 flags; //内存页属性
+		__u64 phandle;//需要导入的虚拟地址
+		__u32 type;//外部内存的类型，由base_mem_import_type定义
+		__u32 padding;//额外的虚拟地址页数，用于在导入的缓冲区后附加更多的虚拟地址页。
+	} in;
+	struct {
+		__u64 flags;
+		__u64 gpu_va;//返回地gpu_va ，同样也是个cookie
+		__u64 va_pages;//gpu va分配的大小
+	} out;
+};
+```
+
+
+
+```
+kbase_mem_import
+-----kbase_check_import_flags
+-----kbase_mem_from_user_buffer
+```
+
+kbase_check_import_flags负责检查导入的内存属性，主要要满足以下条件
+
+```
+1，flag被设置
+2，gpu没有该内存的执行权限
+3，该内存在gpu发生page fault时不可拓展
+4，gpu至少要有读或写该内存的权限
+5, 如果是secure内存，那么cpu要有读的权限
+```
+
+导入内存的type一般都是BASE_MEM_IMPORT_TYPE_USER_BUFFER，另外两个type分别需要CONFIG_DMA_SHARED_BUFFER或CONFIG_COMPAT条件。
+
+此时会直接调用copy_from_user 获取userbuf地址和长度
+
+```c
+copy_from_user(&user_buffer, phandle,
+				sizeof(user_buffer))// buff是struct base_mem_import_user_buffer，用来描述一个user buf的，只有addr和length两个元素，kbase_ioctl_mem_import.in中的phandle就对应这个
+```
+
+如果拷贝的返回为0（也就是拷贝成功），则会调用
+
+```c
+kbase_mem_from_user_buffer(kctx,
+					(unsigned long)uptr, user_buffer.length,
+					va_pages, flags);
+同时会有一个结构体来描述该user_buf属性
+		struct kbase_alloc_import_user_buf {
+			unsigned long address;
+			unsigned long size;
+			unsigned long nr_pages;
+			struct page **pages;
+			
+			/* top bit (1<<31) of current_mapping_usage_count
+			 * specifies that this import was pinned on import
+			 * See PINNED_ON_IMPORT
+			 */
+			u32 current_mapping_usage_count;//最高位设为1的话代表已经被import
+			struct mm_struct *mm;
+			dma_addr_t *dma_addrs;
+		} user_buf;
+					
+					
+```
+
+该函数流程如下
+
+```c
+
+
+	static struct kbase_va_region *kbase_mem_from_user_buffer(
+		struct kbase_context *kctx, unsigned long address,
+		unsigned long size, u64 *va_pages, u64 *flags)
+{
+...
+flag判断以及va_pages的size判断
+
+//指定BASE_MEM_IMPORT_SHARED ，也就是导入的是cpu、gpu的共享区域
+	if (*flags & BASE_MEM_IMPORT_SHARED)
+		shared_zone = true;
+	if (shared_zone) {
+		*flags |= BASE_MEM_NEED_MMAP;
+		zone = KBASE_REG_ZONE_SAME_VA;
+		rbtree = &kctx->reg_rbtree_same;
+	} else
+		rbtree = &kctx->reg_rbtree_custom;
+//分配相应大小的region，以及完成结构体的分配
+reg = kbase_alloc_free_region(rbtree, 0, *va_pages, zone);
+
+	reg->gpu_alloc = kbase_alloc_create(kctx, *va_pages,
+			KBASE_MEM_TYPE_IMPORTED_USER_BUF);
+	reg->cpu_alloc = kbase_mem_phy_alloc_get(reg->gpu_alloc);
+	
+初始化region flags，这与前面的flag检查基本对应
+
+	reg->flags &= ~KBASE_REG_FREE;//正在使用
+	reg->flags |= KBASE_REG_GPU_NX; /* user buf都是没有执行权限的 */
+	reg->flags &= ~KBASE_REG_GROWABLE; /* 不可拓展 */
+//分配struct page
+	if (reg->gpu_alloc->properties & KBASE_MEM_PHY_ALLOC_LARGE)
+		user_buf->pages = vmalloc(*va_pages * sizeof(struct page *));
+	else
+		user_buf->pages = kmalloc_array(*va_pages,
+				sizeof(struct page *), GFP_KERNEL);
+
+    
+    	if (reg->flags & KBASE_REG_SHARE_BOTH) {
+		pages = user_buf->pages;
+		*flags |= KBASE_MEM_IMPORT_HAVE_PAGES;
+	}
+    //如果一个内存区域与 CPU 的一致性（coherent）相关，那么这段内存会立即被导入（imported）并映射到 GPU 上。这意味着 CPU 对该内存的修改将立即反映在 GPU 上，而 GPU 对该内存的修改也将立即反映在 CPU 上，以保持一致性。
+//另一方面，如果内存区域与 CPU 的一致性无关，则会调用 get_user_pages 函数进行一个检查。在这种情况下，get_user_pages 函数会被调用，但是传入的页参数是 NULL，这会导致页错误（page fault），但不会将页面映射在内存中。然后，只有在指定该内存区域作为外部资源的作业周围，才会将该内存区域固定在内存中。
+    
+    	if (reg->flags & KBASE_REG_SHARE_BOTH) {
+		pages = user_buf->pages;//如果我们不设置该flag，page为null
+		*flags |= KBASE_MEM_IMPORT_HAVE_PAGES;
+	}
+    	write = reg->flags & (KBASE_REG_CPU_WR | KBASE_REG_GPU_WR);
+    //fault page&& get pages
+    //get_user_pages() 函数会尝试将指定的用户空间地址区域映射到内核空间，获取到的物理页框通过 pages 参数返回，映射得到的虚拟内存区域结构体指针通过 vmas 参数返回。该函数返回成功映射的页数，如果出现错误则返回一个负值。
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+	faulted_pages = get_user_pages(current, current->mm, address, *va_pages,
+#if KERNEL_VERSION(4, 4, 168) <= LINUX_VERSION_CODE && \
+KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
+			write ? FOLL_WRITE : 0, pages, NULL);
+#else
+			write, 0, pages, NULL);
+#endif
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
+	faulted_pages = get_user_pages(address, *va_pages,
+			write, 0, pages, NULL);
+#else
+	faulted_pages = get_user_pages(address, *va_pages,
+			write ? FOLL_WRITE : 0, pages, NULL);
+#endif
+...
+    if (faulted_pages != *va_pages)//未完全映射所有物理页
+        goto fault_mismatch;
+    
+    reg->gpu_alloc->nents = 0;
+	reg->extent = 0;
+	if (pages) {//设置了KBASE_REG_SHARE_BOTH
+		struct device *dev = kctx->kbdev->dev;
+		struct tagged_addr *pa = kbase_get_gpu_phy_pages(reg);
+//返回reg->gpu_alloc->pages，即gpu_alloc管理的pages数组
+
+		//设置最高位，代表该页已经被import
+        user_buf->current_mapping_usage_count |= PINNED_ON_IMPORT;
+
+		offset_within_page = user_buf->address & ~PAGE_MASK;
+		remaining_size = user_buf->size;
+		for (i = 0; i < faulted_pages; i++) {
+			unsigned long map_size =
+				MIN(PAGE_SIZE - offset_within_page, remaining_size);
+			dma_addr_t dma_addr = dma_map_page(dev, pages[i],
+				offset_within_page, map_size, DMA_BIDIRECTIONAL);
+
+			if (dma_mapping_error(dev, dma_addr))
+				goto unwind_dma_map;
+
+			user_buf->dma_addrs[i] = dma_addr;
+			pa[i] = as_tagged(page_to_phys(pages[i]));//将该页放入gpu_alloc中 
+
+			remaining_size -= map_size;
+			offset_within_page = 0;
+		}
+
+		reg->gpu_alloc->nents = faulted_pages;
+	}
+	return reg;
+    
+    
+    	/* mmap needed to setup VA? */
+	if (*flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) {
+		/* Bind to a cookie */
+		if (!kctx->cookies)
+			goto no_cookie;
+		/* return a cookie */
+		*gpu_va = __ffs(kctx->cookies);
+		kctx->cookies &= ~(1UL << *gpu_va);
+		BUG_ON(kctx->pending_regions[*gpu_va]);
+		kctx->pending_regions[*gpu_va] = reg;
+
+		/* relocate to correct base */
+		*gpu_va += PFN_DOWN(BASE_MEM_COOKIE_BASE);
+		*gpu_va <<= PAGE_SHIFT;
+
+	}
+    
+```
+
+
+
+
+
+回到kbase_import_mem
+
+```c
+//import的页需要映射虚拟地址
+	if (*flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) {
+		/* Bind to a cookie */
+		if (!kctx->cookies)
+			goto no_cookie;
+		/* return a cookie */
+		*gpu_va = __ffs(kctx->cookies);
+		kctx->cookies &= ~(1UL << *gpu_va);
+		BUG_ON(kctx->pending_regions[*gpu_va]);
+		kctx->pending_regions[*gpu_va] = reg;
+
+		/* relocate to correct base */
+		*gpu_va += PFN_DOWN(BASE_MEM_COOKIE_BASE);
+		*gpu_va <<= PAGE_SHIFT;
+	}else if (*flags & KBASE_MEM_IMPORT_HAVE_PAGES)  {
+		/* 调用gpu的mmap 将页映射到gpu内存中 */
+		if (kbase_gpu_mmap(kctx, reg, 0, *va_pages, 1) != 0)
+			goto no_gpu_va;
+		/* return real GPU VA */
+		*gpu_va = reg->start_pfn << PAGE_SHIFT;
+	} else {//啥也木有，貌似返回的是通过页号计算的物理地址？
+		/* we control the VA, but nothing to mmap yet */
+		if (kbase_add_va_region(kctx, reg, 0, *va_pages, 1) != 0)
+			goto no_gpu_va;
+		/* return real GPU VA */
+		*gpu_va = reg->start_pfn << PAGE_SHIFT;
+	}
+	/* clear out private flags */
+	*flags &= ((1UL << BASE_MEM_FLAGS_NR_BITS) - 1);
+
+	kbase_gpu_vm_unlock(kctx);
+
+	return 0;
+```
 
 
 
