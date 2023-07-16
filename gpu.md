@@ -4,6 +4,12 @@
 
 ![GPU管理模型](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/gpu_management_model.png) 
 
+![](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/image-20230716222710906.png)
+
+流式多处理器（Streaming Multiprocessor、SM）是 GPU 的基本单元，每个 GPU 都由一组 SM 构成，SM 中最重要的结构就是计算核心 Core
+
+
+
 **MIMO**
 
 - CPU通过MMIO与GPU进行通信。
@@ -17,16 +23,16 @@
 
 - gpu页表，和CPU的page table功能一样，用于VA到PA的映射，访问GPU的地址空间
 - 驻留在 GPU 内存中，其物理地址位于 GPU 通道描述符中。
-- 所有通过通道提交的命令和程序都在相应的GPU虚拟地址空间中执行。
-- GPU页表不仅将GPU虚拟地址翻译成GPU设备物理地址，而且将其翻译成主机物理地址。这使得GPU页表能够将**GPU内存和主机主内存统一到统一的GPU虚拟地址空间中**。
+- 所有通过GPU Channel提交的命令和程序都在相应的GPU虚拟地址空间中执行。
+- GPU页表不仅将GPU虚拟地址翻译成GPU设备物理地址，而且将其翻译成CPU物理地址。这使得GPU页表能够将**GPU内存和CPU主内存统一到统一的GPU虚拟地址空间中**。
 
 **GPU Channel**。
 
 - 任何操作（例如启动内核）都是由 CPU 发出的命令驱动的。
 - **命令流被提交到称为 GPU Channel的硬件单元。**
-- 每个 GPU 上下文可以有一个或多个 GPU 通道。每个GPU上下文包含GPU通道描述符（每个描述符被创建为GPU内存中的内存对象）。
-- 每个GPU通道描述符存储通道的设置，其中包括***页表***。
-- **每个 GPU 通道都有一个专用的命令缓冲区，该缓冲区分配在 CPU 通过 MMIO 可见的 GPU 内存中。**
+- 每个 GPU 上下文可以有一个或多个 GPU Channel。每个GPU上下文包含GPU Channel Descriptors（每个描述符被创建为GPU内存中的内存对象）。
+- 每个GPU Channel Descriptor存储GPU Channel 的设置，其中包括***页表***。
+- **每个GPU Channel 都有一个专用的命令缓冲区，该缓冲区分配在 CPU 通过 MMIO 可见的 GPU 内存中。**
 
 **PCIe 条**。
 
@@ -40,6 +46,32 @@ CPU和GPU通信主要有几下几种方式：
 - 通过PCIe BAR空间把GPU的内存映射到CPU的地址空间中
 - 通过GPU的页表把CPU的系统内存映射到GPU的地址空间中
 - 通过MSI中断
+
+根据CPU和GPU是否共享内存，可分为两种类型的CPU-GPU架构：
+
+![img](https://qiankunli.github.io/public/upload/kubernetes/cpu_gpu.png)
+
+上图左是**分离式架构**，CPU和GPU各自有独立的缓存和内存，它们通过PCI-e等总线通讯。这种结构的缺点在于 PCI-e 相对于两者具有低带宽和高延迟，数据的传输成了其中的性能瓶颈。目前使用非常广泛，如PC、智能手机等。
+上图右是**耦合式架构**，CPU 和 GPU 共享内存和缓存。AMD 的 APU 采用的就是这种结构。
+
+在存储管理方面，分离式结构中 CPU 和 GPU 各自拥有独立的内存，两者共享一套虚拟地址空间，必要时会进行内存拷贝。对于耦合式结构，GPU 没有独立的内存，与 CPU 共享系统内存，由 MMU 进行存储管理。
+
+
+
+
+
+一个典型的 GPU 设备的工作流程是:
+
+1. 应用层调用 GPU 支持的某个 API，如 OpenGL 或 CUDA
+2. OpenGL 或 CUDA 库，通过 UMD (User Mode Driver)，提交 workload 到 KMD (Kernel Mode Driver)
+3. Kernel Mode Driver 写 CSR MMIO，把它提交给 GPU 硬件
+4. GPU 硬件开始工作… 完成后，DMA 到内存，发出中断给 CPU
+5. CPU 找到中断处理程序 —— Kernel Mode Driver 此前向 OS Kernel 注册过的 —— 调用它
+6. 中断处理程序找到是哪个 workload 被执行完毕了，…最终驱动唤醒相关的应用
+
+
+
+
 
 ### gpu申请内存/释放
 
@@ -616,6 +648,36 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
 
 	return 0;
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
