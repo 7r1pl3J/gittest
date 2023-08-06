@@ -6,7 +6,11 @@
 
 ![](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/image-20230716222710906.png)
 
-流式多处理器（Streaming Multiprocessor、SM）是 GPU 的基本单元，每个 GPU 都由一组 SM 构成，SM 中最重要的结构就是计算核心 Core
+![总体概述](https://github.com/fxlin/mali/raw/main/figs/archoverview.png)
+
+
+
+流式多处理器（Streaming Multiprocessor、SM)是 GPU 的基本单元，每个 GPU 都由一组 SM 构成，SM 中最重要的结构就是计算核心 Core
 
 
 
@@ -56,14 +60,22 @@ CPU和GPU通信主要有几下几种方式：
 
 在存储管理方面，分离式结构中 CPU 和 GPU 各自拥有独立的内存，两者共享一套虚拟地址空间，必要时会进行内存拷贝。对于耦合式结构，GPU 没有独立的内存，与 CPU 共享系统内存，由 MMU 进行存储管理。
 
+### pipeline
 
+这里以render pipeline为例，主要包括三部分：
+
+- Vertex处理，做MPV（Model，View， Project trasform）和Screen mapping坐标变换，clip裁剪
+- Rasterization处理，主要遍历三角形
+- Fragment处理，差值计算处理顶点颜色，纹理贴图等
+
+![GPU pipeline](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/gpu_pipeline.png)
 
 
 
 一个典型的 GPU 设备的工作流程是:
 
 1. 应用层调用 GPU 支持的某个 API，如 OpenGL 或 CUDA
-2. OpenGL 或 CUDA 库，通过 UMD (User Mode Driver)，提交 workload 到 KMD (Kernel Mode Driver)
+2. OpenGL 或 CUDA 库（或者OpenCL），通过 UMD (User Mode Driver)，提交 work 到 KMD (Kernel Mode Driver)
 3. Kernel Mode Driver 写 CSR MMIO，把它提交给 GPU 硬件
 4. GPU 硬件开始工作… 完成后，DMA 到内存，发出中断给 CPU
 5. CPU 找到中断处理程序 —— Kernel Mode Driver 此前向 OS Kernel 注册过的 —— 调用它
@@ -71,17 +83,41 @@ CPU和GPU通信主要有几下几种方式：
 
 
 
+而在gpu硬件视角来看，这种work其实就是job，Mali将所有的API 任务经过GPU驱动处理后，会将任务分解成一个个可以在GPU硬件上执行的Job（工作任务），这个任务交由Job Manager来管理，通过一个Job Description文件来描述每个Job具体要做的事情，Job Description 中包含了要处理的数据项指针地址，比如顶点缓存存储的位置和Shader程序存储的位置，通过ioctl发送给Kernel模块转换成硬件的Warp执行任务。
 
+
+Job Manager是一种用于任务分配的结构。一个render pass中会包含多种job。一般而言，render pass被分解为vertex job,compute job,tile job和fragment job等等，vertex job和compute job进入no-fragment队列执行，fragment进入fragment队列执行
+
+![Midgard软件接口](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/mali_midgard_jobs.png)
+
+![image-20230806172837631](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/image-20230806172837631.png)
+
+由上面我们大致就可以总结出gpu 驱动的主要作用：
+
+1.控制  控制state，设置各种寄存器等等，设备驱动负责向硬件发送命令、配置设备参数、启动和停止设备等操作。
+
+2.内存管理  对应的也就是数据，包括与cpu共享的内存管理，DMA管理，各种内存映射，缓存管理，页表维护管理等等。
+
+3 任务管理  包括任务队列的管理维护，以及任务的调度等等。  
+
+这三个方面共同构成了GPU驱动的核心功能，使得GPU可以高效地执行图形渲染和计算任务，提供强大的计算和图形处理能力。驱动在操作系统内核空间中运行，与用户空间的应用程序进行交互，实现应用程序与GPU硬件之间的桥梁，从而让应用程序可以充分利用GPU的性能和功能。
 
 ### gpu申请内存/释放
 
 当我们用ioctl 指定mem_alloc时，最终会从linux 系统的内存管理模块分配出内存，分配的内存返回给gpu驱动后，可以写入gpu执行所需的数据（job，顶点，纹理之类的），这些数据的写入是用户通过ioctl完成的，当数据写入完成后，就可以trigger kernel driver来执行GPU硬件工作，这个时候GPU硬件需要读取前面准备好的数据，这时需要借助GPU MMU来完成地址的转换工作，否则GPU没有办法完成数据的正确读取。释放的话就是alloc_pages 对应的 free_pages
 
+显卡使用内存，有两种的典型场景。
+
+1. 预先分配。即预先分配好内存，然后直接使用。
+2. 延迟分配。不预先分配物理内存，仅在map时分配虚拟内存，并设置page fault处理接口。当实际使用这段内存时，触发page fault，在page fault处理接口分配内存。
+
+
+
 ![img](https://blogimg-1314041910.cos.ap-guangzhou.myqcloud.com/alloc_memory.svg)
 
-### job创建、提交与执行
 
-//此处没写好
+
+### job创建、提交与执行
 
 当用户向内存填充完数据之后，用户通过ioctl 将该内存 “提交” 给gpu，视作一个job，具体的其实是个建立映射的过程，即让gpu 页表可以映射到该内存。
 
@@ -108,8 +144,6 @@ mali 驱动为用户提供的部分接口如下:
 | 7    | KBASE_IOCTL_MEM_IMPORT       |             将CPU使用的内存页映射到GPU地址空间中             |
 | 8    | KBASE_IOCTL_MEM_FLAGS_CHANGE |                       改变内存区域属性                       |
 |      |                              |                                                              |
-
-
 
 gpu driver 用 region来描述一段内存区域，一段内存区域会有用于映射该区域时gpu/cpu用于内存映射的内存分配对象 即 cpu_alloc,gpu_alloc
 
@@ -651,29 +685,17 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
 
 
 
+kbase_mmu_insert_pages_no_flush 创建ate页表项，插入到pgd中，也就是完成了物理页映射的过程。
 
 
 
 
 
+`do_shared_fault()` 确实是 Linux 内核中处理共享内存缺页中断的函数。这个函数用于处理共享虚拟地址空间的情况，当 CPU 触发 Page Fault 并需要访问 GPU 分配的虚拟地址空间时，会调用这个函数来解决共享内存缺页。
 
+在这个函数中，操作系统会检查导致 Page Fault 的虚拟地址，并尝试解决缺页。对于共享内存缺页中断，需要在 CPU 和 GPU 之间进行协作，将 GPU 分配的虚拟地址空间映射到 CPU 的页表中，从而使得 CPU 能够正确访问 GPU 分配的虚拟地址空间。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+具体的实现细节可能因操作系统版本和 GPU 驱动程序而有所差异，但在一般情况下，`do_shared_fault()` 函数会涉及操作系统的页错误处理程序与 GPU 驱动程序之间的协同工作，以完成对 GPU 分配虚拟地址空间的正确映射。如果您有更多关于这个函数的代码或文档，我可以帮您更具体地分析和解释。
 
 
 
