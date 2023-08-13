@@ -21,7 +21,7 @@
 
 **GPU context**
 
-代表GPU当前状态，每个context有自己的page table，多个context可以同时共存（可以视为类似进程的概念？）
+代表GPU当前状态，每个context有自己的page table，多个context可以同时共存（可以视为类似进程的概念？），使用 Mali GPU 驱动程序时，用户应用程序首先需要创建并初始化`kbase_context`内核对象。这涉及用户应用程序打开驱动程序文件并使用生成的文件描述符进行一系列`ioctl`调用。对象`kbase_context`负责管理每个打开的驱动程序文件的资源，并且对于每个文件句柄来说都是唯一的。
 
 **Page Table** 
 
@@ -145,7 +145,7 @@ mali 驱动为用户提供的部分接口如下:
 | 8    | KBASE_IOCTL_MEM_FLAGS_CHANGE |                       改变内存区域属性                       |
 |      |                              |                                                              |
 
-gpu driver 用 region来描述一段内存区域，一段内存区域会有用于映射该区域时gpu/cpu用于内存映射的内存分配对象 即 cpu_alloc,gpu_alloc
+gpu driver 用 region来描述一段内存区域，一段内存区域会有用于映射该区域时gpu/cpu用于内存映射的内存分配对象 即 cpu_alloc,gpu_alloc，分别跟踪gpu/cpu当前正在使用的页面。
 
 ```c
 struct kbase_va_region {
@@ -235,6 +235,8 @@ struct kbase_mem_phy_alloc {
 ```
 
 ## 映射流程
+
+gpu申请内存主要有两种方式，一种是gpu驱动直接调用调用内核提供的内存分配函数来申请页；另一种则是通过导入cpu侧的用户内存实现共享，使用KBASE_MEM_TYPE_IMPORTED_USER_BUF类型，gpu驱动会通过get_user_pages获取该用户内存所对应的页并增加其引用计数（确保gpu使用该页面的时候不会被释放），页面会填充到kbase_mem_phy_alloc的pages数组中，在gpu不再使用该内存的时候，pages会将该页面删除并减少其引用计数。
 
 KBASE_IOCTL_MEM_ALLOC 以及 KBASE_IOCTL_MEM_IMPORT 都可以映射内存页到gpu中，这里我们先以 KBASE_IOCTL_MEM_IMPORT为例
 
@@ -445,7 +447,30 @@ vma的flag位设置，可以看出子进程是不共享该gpu内存的
 	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_IO;
 ```
 
-与直接分配物理页不同，KBASE_IOCTL_MEM_IMPORT可以导入cpu的地址到gpu，传入的参数为
+与直接分配物理页不同，KBASE_IOCTL_MEM_IMPORT可以导入cpu的地址到gpu，
+
+>  //如果一个内存区域与 CPU 的一致性（coherent）相关，那么这段内存会立即被导入（imported）并映射到 GPU 上。这意味着 CPU 对该内存的修改将立即反映在 GPU 上，而 GPU 对该内存的修改也将立即反映在 CPU 上，以保持一致性。
+> //另一方面，如果内存区域与 CPU 的一致性无关，则会调用 get_user_pages 函数进行一个检查。在这种情况下，get_user_pages 函数会被调用，但是传入的页参数是 NULL，这会导致页错误（page fault），但不会将页面映射在内存中。然后，只有在指定该内存区域作为外部资源的作业周围，才会将该内存区域固定在内存中。有点类似linux内核的cow（写时复制）
+>
+> 这里需要区分固定和获取页面引用两种概念：
+>
+> 1. **固定页面（Page Pinning）**：对应接口如pin_user_pages()
+>
+>    - **定义**：固定页面是指将页面锁定在物理内存中，使其不会被操作系统的页面置换机制所替换出去。这样可以确保在页面固定期间，该页面的数据在内存中保持不变。
+>    - **用途**：常用于需要临时性地确保某些页面不被换出，例如在进行高性能的数据处理、DMA（直接内存访问）传输、硬件操作等情况下。
+>    - **注意**：固定页面可能导致内存紧张，因为固定的页面不能被页面置换机制回收，从而占用了额外的物理内存。
+>
+> 2. **获取页面引用（Page Reference**：对应接口如get_user_pages（）
+>
+>    - **定义**：获取页面引用是指通过操作系统提供的函数获取对页面的引用（类似于指针），可以用于读取或操作页面的数据，而不会使页面被固定。
+>    - **用途**：常用于需要读取页面数据，而不需要对页面进行固定或写入操作的情况下。获取页面引用不会影响页面置换机制。
+>    - **注意**：获取页面引用并不会阻止页面被替换，因此页面的数据可能在任何时候都会被置换出去。
+>
+>    还需要注意的是pin_user_pages()除了固定了对应的页面以外，还会增加对应页面的引用计数，unpin操作的时候会执行对应相反的操作。
+>
+>    显然，当gpu需要使用物理内存时，需要固定该物理内存区域从而提供更可靠的性能和一致的访问延迟。
+
+传入的参数为
 
 ```c
 union kbase_ioctl_mem_import {
@@ -530,7 +555,7 @@ flag判断以及va_pages的size判断
 //指定BASE_MEM_IMPORT_SHARED ，也就是导入的是cpu、gpu的共享区域
 	if (*flags & BASE_MEM_IMPORT_SHARED)
 		shared_zone = true;
-	if (shared_zone) {
+	if (shared_zone) {//TODO 
 		*flags |= BASE_MEM_NEED_MMAP;
 		zone = KBASE_REG_ZONE_SAME_VA;
 		rbtree = &kctx->reg_rbtree_same;
@@ -564,29 +589,37 @@ reg = kbase_alloc_free_region(rbtree, 0, *va_pages, zone);
 //另一方面，如果内存区域与 CPU 的一致性无关，则会调用 get_user_pages 函数进行一个检查。在这种情况下，get_user_pages 函数会被调用，但是传入的页参数是 NULL，这会导致页错误（page fault），但不会将页面映射在内存中。然后，只有在指定该内存区域作为外部资源的作业周围，才会将该内存区域固定在内存中。
     
     	if (reg->flags & KBASE_REG_SHARE_BOTH) {
-		pages = user_buf->pages;//如果我们不设置该flag，page为null
+		pages = user_buf->pages;//如果我们不设置该flag，page为null，设置了的话，pages就会直接填充进去
 		*flags |= KBASE_MEM_IMPORT_HAVE_PAGES;
 	}
     	write = reg->flags & (KBASE_REG_CPU_WR | KBASE_REG_GPU_WR);
     //fault page&& get pages
     //get_user_pages() 函数会尝试将指定的用户空间地址区域映射到内核空间，获取到的物理页框通过 pages 参数返回，映射得到的虚拟内存区域结构体指针通过 vmas 参数返回。该函数返回成功映射的页数，如果出现错误则返回一个负值。
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
-	faulted_pages = get_user_pages(current, current->mm, address, *va_pages,
-#if KERNEL_VERSION(4, 4, 168) <= LINUX_VERSION_CODE && \
-KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
-			write ? FOLL_WRITE : 0, pages, NULL);
-#else
-			write, 0, pages, NULL);
-#endif
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	faulted_pages = get_user_pages(address, *va_pages,
-			write, 0, pages, NULL);
-#else
+#if KERNEL_VERSION(5, 9, 0) > LINUX_VERSION_CODE
 	faulted_pages = get_user_pages(address, *va_pages,
 			write ? FOLL_WRITE : 0, pages, NULL);
+#else
+	/* pin_user_pages 函数不能使用 NULL 的 pages 参数进行调用。这意味着在调用 pin_user_pages 函数时，必须传递一个非空的 pages 参数，以指定用于存储页面引用的数组。
+如果在 pages 参数为 NULL 的情况下进行页面引用操作，则使用 get_user_pages 函数代替。在此情况下，只要不使用 FOLL_GET 标志，传递 NULL 的 pages 参数是安全的。
+此时的pages为null，但这并不影响faulted_pages为引用address的物理页数量，只是未填充到pages中。 
+我在翻阅get_user_pages的时候确实看到了对应的源码实现：
+在__get_user_pages()中：
+ret = get_gate_page(mm, start & PAGE_MASK,
+						gup_flags, &vma,
+						pages ? &pages[i] : NULL);
+	 */
+	if (pages != NULL) {
+		faulted_pages =
+			pin_user_pages(address, *va_pages, write ? FOLL_WRITE : 0, pages, NULL);
+	} else {
+		faulted_pages =
+			get_user_pages(address, *va_pages, write ? FOLL_WRITE : 0, pages, NULL);
+	}
+
 #endif
 ...
-    if (faulted_pages != *va_pages)//未完全映射所有物理页
+    if (faulted_pages != *va_pages)//只有在获取页面引用时发生错误时，才会进入 fault_mismatch 分支。
+ 
         goto fault_mismatch;
     
     reg->gpu_alloc->nents = 0;
@@ -619,36 +652,35 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
 
 		reg->gpu_alloc->nents = faulted_pages;
 	}
-	return reg;
+	return reg;//不过pages是否为null，只要正确执行获取页面了，就都可以返回reg，只是未指定share both的时候 reg的pages为null。
     
     
-    	/* mmap needed to setup VA? */
-	if (*flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) {
-		/* Bind to a cookie */
-		if (!kctx->cookies)
-			goto no_cookie;
-		/* return a cookie */
-		*gpu_va = __ffs(kctx->cookies);
-		kctx->cookies &= ~(1UL << *gpu_va);
-		BUG_ON(kctx->pending_regions[*gpu_va]);
-		kctx->pending_regions[*gpu_va] = reg;
-
-		/* relocate to correct base */
-		*gpu_va += PFN_DOWN(BASE_MEM_COOKIE_BASE);
-		*gpu_va <<= PAGE_SHIFT;
-
+unwind_dma_map:
+	while (i--) {
+		dma_unmap_page(kctx->kbdev->dev,
+				user_buf->dma_addrs[i],
+				PAGE_SIZE, DMA_BIDIRECTIONAL);
 	}
-    
+   fault_mismatch:
+	if (pages) {//这个时候，该内存区域还未被填充到region中，所以unpin该内存区域之前并不需要解除cpu侧的映射（也就是上面if pages那段没进去，pages未被填充，dma也未映射）
+		for (i = 0; i < faulted_pages; i++)
+			kbase_unpin_user_buf_page(pages[i]);
+	}
+no_page_array:
+invalid_flags:
+	kbase_mem_phy_alloc_put(reg->cpu_alloc);
+	kbase_mem_phy_alloc_put(reg->gpu_alloc);
+no_alloc_obj:
+	kfree(reg);
+no_region:
+bad_size:
+	return NULL;     
 ```
 
-
-
-
-
-回到kbase_import_mem
+回到kbase_mem_import
 
 ```c
-//import的页需要映射虚拟地址
+//import的页需要映射虚拟地址，这里与kbase_mem_alloc类似
 	if (*flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) {
 		/* Bind to a cookie */
 		if (!kctx->cookies)
@@ -658,7 +690,6 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
 		kctx->cookies &= ~(1UL << *gpu_va);
 		BUG_ON(kctx->pending_regions[*gpu_va]);
 		kctx->pending_regions[*gpu_va] = reg;
-
 		/* relocate to correct base */
 		*gpu_va += PFN_DOWN(BASE_MEM_COOKIE_BASE);
 		*gpu_va <<= PAGE_SHIFT;
@@ -681,17 +712,53 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
 	kbase_gpu_vm_unlock(kctx);
 
 	return 0;
+no_reg:
+bad_flags:
+	*gpu_va = 0;
+	*va_pages = 0;
+	*flags = 0;
+	return -ENOMEM;
+
 ```
 
 
 
-kbase_mmu_insert_pages_no_flush 创建ate页表项，插入到pgd中，也就是完成了物理页映射的过程。
+kbase_gpu_mmap->()kbase_mmu_insert_pages（）->kbase_mmu_insert_pages_no_flush（） 创建ate页表项，插入到pgd中，也就是完成了gpu侧物理页映射虚拟地址的过程。
 
+```c
+//插入页表项过程代码片段：			
+for (i = 0; i < count; i++) {
+				unsigned int ofs = vindex + i;
+				u64 *target = &pgd_page[ofs];
 
+				/* Warn if the current page is a valid ATE
+				 * entry. The page table shouldn't have anything
+				 * in the place where we are trying to put a
+				 * new entry. Modification to page table entries
+				 * should be performed with
+				 * kbase_mmu_update_pages()
+				 */
+				WARN_ON((*target & 1UL) != 0);
 
+				*target = kbase_mmu_create_ate(kbdev,
+					phys[i], flags, cur_level, group_id);
+			}
+			num_of_valid_entries += count;
+		}
 
+		mmu_mode->set_num_valid_entries(pgd_page, num_of_valid_entries);
 
-`do_shared_fault()` 确实是 Linux 内核中处理共享内存缺页中断的函数。这个函数用于处理共享虚拟地址空间的情况，当 CPU 触发 Page Fault 并需要访问 GPU 分配的虚拟地址空间时，会调用这个函数来解决共享内存缺页。
+		if (dirty_pgds && count > 0 && !newly_created_pgd)
+			*dirty_pgds |= 1ULL << cur_level;
+
+		phys += count;
+		insert_vpfn += count;
+		remain -= count;
+```
+
+而cpu侧的映射如何建立？应该就是mmap中的处理，但接受到的值应该是个cookie？到底怎么得到相同值的虚拟地址的
+
+`do_shared_fault()` 是 Linux 内核中处理共享内存缺页中断的函数，我们使用mmap导入共享内存的时候便指定了VM_SHARED，当 CPU 触发 Page Fault 并需要访问 GPU 分配的虚拟地址空间时，会调用这个函数来解决共享内存缺页。
 
 在这个函数中，操作系统会检查导致 Page Fault 的虚拟地址，并尝试解决缺页。对于共享内存缺页中断，需要在 CPU 和 GPU 之间进行协作，将 GPU 分配的虚拟地址空间映射到 CPU 的页表中，从而使得 CPU 能够正确访问 GPU 分配的虚拟地址空间。
 
